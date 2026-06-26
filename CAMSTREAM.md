@@ -67,36 +67,58 @@ byte 12+:   raw H.264 Annex B データ (MediaCodec 出力そのまま)
 ### 前提条件
 
 - `adb` が PATH に存在すること
-- `scrcpy-server.jar` がビルド済みであること
+- `scrcpy-server` が利用可能であること (下記セットアップ参照)
 - Android 12 以上 (Camera2 API によるカメラキャプチャの要件)
+- `ffplay` または `ffmpeg` (再生・変換する場合)
 
-### サーバー JAR のビルド
+### セットアップ
+
+#### Homebrew (macOS / Linux — 推奨)
 
 ```bash
-cd server
-./gradlew assembleDebug
+brew install scrcpy
 ```
 
-ビルド成果物は `server/build/outputs/apk/debug/scrcpy-server-debug.apk` に生成される。
-環境変数 `SCRCPY_SERVER_PATH` で任意のパスを指定することも可能。
+scrcpy-server が自動的にインストールされ、camstream が自動検出する。
+
+#### 手動ビルド
+
+JDK と Android SDK が必要。
+
+```bash
+ANDROID_HOME=~/Library/Android/sdk BUILD_DIR=build-server bash server/build_without_gradle.sh
+```
+
+ビルド成果物は `build-server/scrcpy-server` に生成される。
+
+#### 環境変数で指定
+
+自動検出で見つからない場合は環境変数で直接パスを指定できる。
+
+```bash
+export SCRCPY_SERVER_PATH=/path/to/scrcpy-server
+```
 
 ### 実行例
 
 ```bash
+# カメラ一覧を表示 (まずこれで利用可能なカメラを確認)
+./camstream --list-cameras
+
 # 4K カメラストリーム → ffplay でリアルタイム再生
 ./camstream | ffplay -f h264 -
 
-# 1080p で H.264 ファイルとして保存
+# 1080p で H.264 ファイルとして保存 (Ctrl+C で停止)
 ./camstream --size 1920x1080 > capture.h264
 
 # 背面カメラ、高ビットレート、30fps
-./camstream --camera-facing back --bitrate 20000000 --fps 30 | ffplay -f h264 -
+./camstream --camera-facing back -b 20000000 --fps 30 | ffplay -f h264 -
 
-# VLC で再生
-./camstream | vlc --demux h264 -
+# ffmpeg で MP4 に変換しながら保存
+./camstream --fps 30 | ffmpeg -f h264 -framerate 30 -i - -c copy output.mp4
 
-# カメラ一覧を表示
-./camstream --list-cameras
+# 特定のデバイスを指定
+./camstream -s SERIAL_NUMBER --size 1920x1080 > capture.h264
 ```
 
 ### コマンドラインオプション
@@ -112,7 +134,7 @@ cd server
 | `--camera-facing` | (指定なし) | `front` / `back` / `external` |
 | `--video-codec` | `h264` | `h264` / `h265` / `av1` |
 | `--encoder` | (既定エンコーダ) | デバイス固有のエンコーダ名 |
-| `--server-path` | (自動検出) | scrcpy-server JAR のパス |
+| `--server-path` | (自動検出) | scrcpy-server のパス |
 | `--list-cameras` | - | カメラ一覧を表示して終了 |
 
 ## scrcpy コードベースとの関係

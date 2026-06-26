@@ -45,7 +45,7 @@ def find_server_jar():
         os.path.join(os.path.dirname(__file__), "scrcpy-server"),
     ]
     # Also check common install locations
-    for prefix in ["/usr/local/share/scrcpy", "/usr/share/scrcpy"]:
+    for prefix in ["/opt/homebrew/share/scrcpy", "/usr/local/share/scrcpy", "/usr/share/scrcpy"]:
         candidates.append(os.path.join(prefix, "scrcpy-server"))
 
     for path in candidates:
@@ -145,11 +145,10 @@ def start_server(scid, args, serial=None):
 def connect_to_server(port, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2.0)
             sock.connect(("127.0.0.1", port))
-            # Read the dummy byte that scrcpy server sends on connect
             dummy = sock.recv(1)
             if len(dummy) == 1:
                 log("Connected to server")
@@ -157,6 +156,7 @@ def connect_to_server(port, timeout=10.0):
                 return sock
             sock.close()
         except (ConnectionRefusedError, socket.timeout, OSError):
+            sock.close()
             time.sleep(0.1)
     die("Timeout connecting to server")
 
@@ -306,15 +306,24 @@ def main():
 
     scid = os.getpid() & 0x7FFFFFFF
 
-    # Set up signal handler for clean shutdown
     server_proc = None
     local_port = None
+    sock = None
 
     def cleanup(signum=None, frame=None):
+        nonlocal server_proc, local_port, sock
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            sock = None
         if server_proc and server_proc.poll() is None:
             server_proc.terminate()
+        server_proc = None
         if local_port:
             remove_forward(local_port, serial)
+        local_port = None
         if signum:
             sys.exit(0)
 
@@ -326,18 +335,12 @@ def main():
         local_port, socket_name = setup_forward(scid, serial)
         server_proc = start_server(scid, args, serial)
 
-        # Give the server a moment to start
         time.sleep(0.5)
 
         sock = connect_to_server(local_port)
-
-        # Read device meta (64 bytes device name)
         read_device_meta(sock)
-
-        # Read codec id (4 bytes)
         read_codec_id(sock)
 
-        # Stream H.264 to stdout
         out_fd = sys.stdout.buffer.fileno()
         stream_loop(sock, out_fd)
 
