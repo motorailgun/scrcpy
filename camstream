@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+camstream - Stream Android camera H.264 to stdout via scrcpy server.
+
+Pushes scrcpy-server.jar to the Android device, opens the camera at
+the requested resolution (default 4K), hardware-encodes to H.264, and
+writes the raw Annex B elementary stream to stdout.
+
+Usage:
+    ./camstream | ffplay -f h264 -
+    ./camstream --size 1920x1080 | vlc --demux h264 -
+    ./camstream --camera-id 0 --bitrate 20000000 > capture.h264
+
+Requires: adb in PATH, scrcpy-server.jar (built from this repo).
+"""
+
+import argparse
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+DEVICE_SERVER_PATH = "/data/local/tmp/scrcpy-server.jar"
+SOCKET_NAME_PREFIX = "scrcpy"
+SCRCPY_VERSION = "4.0"
+
+PACKET_FLAG_SESSION = 1 << 63
+PACKET_FLAG_CONFIG = 1 << 62
+PACKET_FLAG_KEY_FRAME = 1 << 61
+
+
+def find_server_jar():
+    env = os.environ.get("SCRCPY_SERVER_PATH")
+    if env and os.path.isfile(env):
+        return env
+
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "server", "build", "outputs",
+                     "apk", "debug", "scrcpy-server-debug.apk"),
+        os.path.join(os.path.dirname(__file__), "build-server",
+                     "server", "scrcpy-server"),
+        os.path.join(os.path.dirname(__file__), "scrcpy-server"),
+    ]
+    # Also check common install locations
+    for prefix in ["/usr/local/share/scrcpy", "/usr/share/scrcpy"]:
+        candidates.append(os.path.join(prefix, "scrcpy-server"))
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    return None
+
+
+def adb(*args, serial=None, capture=False):
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += list(args)
+    if capture:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd)
+
+
+def push_server(jar_path, serial=None):
+    log(f"Pushing server to device: {jar_path}")
+    r = adb("push", jar_path, DEVICE_SERVER_PATH, serial=serial)
+    if r.returncode != 0:
+        die("Failed to push server to device")
+
+
+def setup_forward(scid, serial=None):
+    socket_name = f"{SOCKET_NAME_PREFIX}_{scid:08x}"
+    r = adb("forward", "tcp:0", f"localabstract:{socket_name}",
+            serial=serial, capture=True)
+    if r.returncode != 0:
+        die("Failed to set up adb forward")
+    port = int(r.stdout.strip())
+    log(f"Forwarded local port {port} -> {socket_name}")
+    return port, socket_name
+
+
+def remove_forward(port, serial=None):
+    adb("forward", "--remove", f"tcp:{port}", serial=serial)
+
+
+def start_server(scid, args, serial=None):
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += [
+        "shell",
+        f"CLASSPATH={DEVICE_SERVER_PATH}",
+        "app_process",
+        "/",
+        "com.genymobile.scrcpy.Server",
+        SCRCPY_VERSION,
+    ]
+
+    params = [
+        f"scid={scid:08x}",
+        "log_level=info",
+        "video=true",
+        "audio=false",
+        "control=false",
+        "video_source=camera",
+        "tunnel_forward=true",
+        "send_frame_meta=true",
+        "cleanup=true",
+    ]
+
+    if args.video_codec and args.video_codec != "h264":
+        params.append(f"video_codec={args.video_codec}")
+
+    if args.size:
+        params.append(f"camera_size={args.size}")
+
+    if args.camera_id is not None:
+        params.append(f"camera_id={args.camera_id}")
+
+    if args.camera_facing:
+        params.append(f"camera_facing={args.camera_facing}")
+
+    if args.bitrate:
+        params.append(f"video_bit_rate={args.bitrate}")
+
+    if args.fps:
+        params.append(f"camera_fps={args.fps}")
+
+    if args.max_size:
+        params.append(f"max_size={args.max_size}")
+
+    if args.encoder:
+        params.append(f"video_encoder={args.encoder}")
+
+    cmd += params
+    log(f"Starting server: {' '.join(params)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return proc
+
+
+def connect_to_server(port, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect(("127.0.0.1", port))
+            # Read the dummy byte that scrcpy server sends on connect
+            dummy = sock.recv(1)
+            if len(dummy) == 1:
+                log("Connected to server")
+                sock.settimeout(None)
+                return sock
+            sock.close()
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            time.sleep(0.1)
+    die("Timeout connecting to server")
+
+
+def recv_all(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+def read_device_meta(sock):
+    data = recv_all(sock, 64)
+    if data is None:
+        die("Failed to read device meta")
+    name = data.rstrip(b'\x00').decode('utf-8', errors='replace')
+    log(f"Device: {name}")
+    return name
+
+
+def read_codec_id(sock):
+    data = recv_all(sock, 4)
+    if data is None:
+        die("Failed to read codec id")
+    codec_id = struct.unpack(">I", data)[0]
+    codec_name = data.decode('ascii', errors='replace').strip('\x00')
+    log(f"Codec: {codec_name} (0x{codec_id:08x})")
+    return codec_id
+
+
+def stream_loop(sock, out_fd):
+    """Read scrcpy framing, strip headers, write raw H.264 to out_fd."""
+    bytes_written = 0
+    frames = 0
+
+    while True:
+        header = recv_all(sock, 12)
+        if header is None:
+            break
+
+        # Check if session packet (MSB set)
+        if header[0] & 0x80:
+            width = struct.unpack(">I", header[4:8])[0]
+            height = struct.unpack(">I", header[8:12])[0]
+            log(f"Session: {width}x{height}")
+            continue
+
+        # Media packet
+        pts_flags = struct.unpack(">Q", header[0:8])[0]
+        pkt_size = struct.unpack(">I", header[8:12])[0]
+
+        if pkt_size == 0:
+            log("Warning: zero-length packet")
+            continue
+
+        data = recv_all(sock, pkt_size)
+        if data is None:
+            break
+
+        is_config = bool(pts_flags & PACKET_FLAG_CONFIG)
+        is_key = bool(pts_flags & PACKET_FLAG_KEY_FRAME)
+
+        # Write raw H.264 data (already in Annex B format from MediaCodec)
+        try:
+            os.write(out_fd, data)
+        except BrokenPipeError:
+            break
+
+        if not is_config:
+            frames += 1
+        bytes_written += len(data)
+
+    log(f"Stream ended: {frames} frames, {bytes_written} bytes")
+
+
+def log(msg):
+    print(f"camstream: {msg}", file=sys.stderr)
+
+
+def die(msg):
+    log(f"ERROR: {msg}")
+    sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Stream Android camera H.264 to stdout")
+    parser.add_argument("--serial", "-s",
+                        help="ADB device serial (or use ANDROID_SERIAL)")
+    parser.add_argument("--size", default="3840x2160",
+                        help="Camera capture size (default: 3840x2160 = 4K)")
+    parser.add_argument("--max-size", type=int, default=0,
+                        help="Max dimension (downscale if larger)")
+    parser.add_argument("--bitrate", "-b", type=int, default=8000000,
+                        help="Video bitrate in bps (default: 8000000)")
+    parser.add_argument("--fps", type=int, default=0,
+                        help="Camera FPS (0 = device default)")
+    parser.add_argument("--camera-id",
+                        help="Camera ID (use scrcpy --list-cameras to find)")
+    parser.add_argument("--camera-facing",
+                        choices=["front", "back", "external"],
+                        help="Camera facing direction")
+    parser.add_argument("--video-codec", default="h264",
+                        choices=["h264", "h265", "av1"],
+                        help="Video codec (default: h264)")
+    parser.add_argument("--encoder",
+                        help="Video encoder name (device-specific)")
+    parser.add_argument("--server-path",
+                        help="Path to scrcpy-server JAR")
+    parser.add_argument("--list-cameras", action="store_true",
+                        help="List available cameras and exit")
+
+    args = parser.parse_args()
+
+    serial = args.serial or os.environ.get("ANDROID_SERIAL")
+
+    # Find server JAR
+    jar_path = args.server_path or find_server_jar()
+    if not jar_path:
+        die("scrcpy-server not found. Build it first or set SCRCPY_SERVER_PATH.\n"
+            "  cd server && ./gradlew assembleDebug")
+
+    # Handle --list-cameras
+    if args.list_cameras:
+        push_server(jar_path, serial)
+        cmd = ["adb"]
+        if serial:
+            cmd += ["-s", serial]
+        cmd += [
+            "shell",
+            f"CLASSPATH={DEVICE_SERVER_PATH}",
+            "app_process", "/",
+            "com.genymobile.scrcpy.Server", SCRCPY_VERSION,
+            "list_cameras=true", "list_camera_sizes=true",
+        ]
+        subprocess.run(cmd)
+        return
+
+    if sys.stdout.isatty():
+        die("stdout is a terminal. Pipe the output to a player or file.\n"
+            "  Examples:\n"
+            "    ./camstream | ffplay -f h264 -\n"
+            "    ./camstream > capture.h264")
+
+    scid = os.getpid() & 0x7FFFFFFF
+
+    # Set up signal handler for clean shutdown
+    server_proc = None
+    local_port = None
+
+    def cleanup(signum=None, frame=None):
+        if server_proc and server_proc.poll() is None:
+            server_proc.terminate()
+        if local_port:
+            remove_forward(local_port, serial)
+        if signum:
+            sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    try:
+        push_server(jar_path, serial)
+        local_port, socket_name = setup_forward(scid, serial)
+        server_proc = start_server(scid, args, serial)
+
+        # Give the server a moment to start
+        time.sleep(0.5)
+
+        sock = connect_to_server(local_port)
+
+        # Read device meta (64 bytes device name)
+        read_device_meta(sock)
+
+        # Read codec id (4 bytes)
+        read_codec_id(sock)
+
+        # Stream H.264 to stdout
+        out_fd = sys.stdout.buffer.fileno()
+        stream_loop(sock, out_fd)
+
+    except KeyboardInterrupt:
+        log("Interrupted")
+    finally:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()
